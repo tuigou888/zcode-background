@@ -37,8 +37,9 @@ param(
     [ValidateRange(1, 65535)]
     [int]$MediaPort = 9231,
 
-    # 本机 ZCode 主程序路径，可在安装位置变化后手动覆盖。
-    [string]$ZCodePath = "D:\ProgramFiles\ZCode\ZCode.exe",
+    # ZCode 主程序路径。留空（默认）时自动探测：
+    # Windows 常见安装目录，Linux /opt/ZCode/zcode 等。安装在非标准位置再手动指定。
+    [string]$ZCodePath = "",
 
     # 仅验证参数和资源，不关闭或启动 ZCode。
     [switch]$ValidateOnly
@@ -223,7 +224,7 @@ function Start-MediaHttpServer {
     # 用后台 Runspace 处理请求，避免阻塞主线程（主线程要等 ZCode 退出）。
     $ps = [PowerShell]::Create()
     $null = $ps.AddScript({
-        param($Listener, $Directory, $ImgExt, $VidExt, $RandomMode)
+        param($Listener, $Directory, $ImgExt, $VidExt, $RandomMode, $WindowsOs)
 
         $script:ImageExtensions = $ImgExt
         $script:VideoExtensions = $VidExt
@@ -320,9 +321,12 @@ function Start-MediaHttpServer {
 
                 # 普通文件请求：严格限定在目录内，防止路径穿越（../ 之类）。
                 # 使用 GetFullPath 规范化后再比对根目录前缀。
+                # 分隔符与大小写比较需跨平台：Linux 是 '/' 且区分大小写。
+                $sep = [IO.Path]::DirectorySeparatorChar
                 $fullPath = [IO.Path]::GetFullPath([IO.Path]::Combine($Directory, $decoded))
-                $rootNorm = [IO.Path]::GetFullPath($Directory).TrimEnd('\') + '\'
-                if (-not $fullPath.StartsWith($rootNorm, [StringComparison]::OrdinalIgnoreCase)) {
+                $rootNorm = [IO.Path]::GetFullPath($Directory).TrimEnd([char]$sep) + $sep
+                $comparison = if ($WindowsOs) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+                if (-not $fullPath.StartsWith($rootNorm, $comparison)) {
                     $res.StatusCode = 403
                     $res.Close()
                     continue
@@ -409,7 +413,7 @@ function Start-MediaHttpServer {
                 } catch {}
             }
         }
-    }).AddArgument($listener).AddArgument($Directory).AddArgument($script:ImageExtensions).AddArgument($script:VideoExtensions).AddArgument($RandomMode)
+    }).AddArgument($listener).AddArgument($Directory).AddArgument($script:ImageExtensions).AddArgument($script:VideoExtensions).AddArgument($RandomMode).AddArgument($IsWindows)
 
     $handle = $ps.BeginInvoke()
 
@@ -451,35 +455,103 @@ function Stop-ZCodeProcesses {
         [string]$ExecutablePath
     )
 
-    $processes = @(Get-Process -Name "ZCode" -ErrorAction SilentlyContinue)
+    # Linux 与 Windows 下主进程名一致为 "ZCode"，但再按进程名+可执行路径双匹配，避免误伤/漏杀。
+    $processes = @(
+        (Get-Process -Name "ZCode","zcode" -ErrorAction SilentlyContinue) +
+        (Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -and ($_.Path -eq $ExecutablePath) } catch { $false }
+        })
+    ) | Sort-Object Id -Unique
+
     if ($processes.Count -eq 0) {
         return
     }
 
     Write-Host "正在关闭当前 ZCode..."
 
-    # 优先请求主窗口正常退出，让 ZCode 有机会保存界面状态。
-    foreach ($process in $processes) {
-        if ($process.MainWindowHandle -ne 0) {
-            [void]$process.CloseMainWindow()
+    # Windows：优先请求主窗口正常退出，让 ZCode 有机会保存界面状态。
+    # Linux：MainWindowHandle 恒为 0（无窗口句柄），改用 SIGTERM，Chromium/Electron 会优雅退出。
+    if ($IsWindows) {
+        foreach ($process in $processes) {
+            if ($process.MainWindowHandle -ne 0) {
+                [void]$process.CloseMainWindow()
+            }
         }
+    }
+    else {
+        $processes | Stop-Process -ErrorAction SilentlyContinue
     }
 
     $deadline = [DateTime]::UtcNow.AddSeconds(8)
     do {
         Start-Sleep -Milliseconds 250
-        $remaining = @(Get-Process -Name "ZCode" -ErrorAction SilentlyContinue)
+        $remaining = @(Get-Process -Name "ZCode","zcode" -ErrorAction SilentlyContinue)
     } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
 
     if ($remaining.Count -gt 0) {
         # 用户已允许脚本自动重启 ZCode；只终止同名 ZCode 进程，不操作其他程序。
+        # Linux 下 -Force = SIGKILL。
         $remaining | Stop-Process -Force -ErrorAction Stop
         Wait-Process -Id $remaining.Id -Timeout 10 -ErrorAction SilentlyContinue
     }
 
-    if (Get-Process -Name "ZCode" -ErrorAction SilentlyContinue) {
+    if (Get-Process -Name "ZCode","zcode" -ErrorAction SilentlyContinue) {
         throw "无法完全关闭 ZCode，请手动退出后重试。"
     }
+}
+
+function Find-ZCodeExecutable {
+    # 跨平台自动探测 ZCode 主程序路径（安装脚本之外的兜底）。
+    # 优先级：运行中进程 → PATH/Linux 常见路径 → Windows 常见安装目录。
+    $proc = Get-Process -Name "ZCode","zcode" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($proc) {
+        try {
+            if ($proc.Path -and (Test-Path -LiteralPath $proc.Path -PathType Leaf)) {
+                return $proc.Path
+            }
+        } catch {}
+    }
+
+    if (-not $IsWindows) {
+        $inPath = Get-Command "zcode" -ErrorAction SilentlyContinue
+        if ($inPath) {
+            try {
+                $item = Get-Item -LiteralPath $inPath.Source -ErrorAction Stop
+                $resolved = if ($item.LinkType) { $item.ResolveTarget().Path } else { $item.FullName }
+                if ($resolved -and (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+                    return $resolved
+                }
+            } catch {}
+        }
+        $commonPaths = @(
+            "/opt/ZCode/zcode",
+            "/usr/lib/ZCode/zcode",
+            "/usr/local/bin/zcode",
+            "/snap/zcode/current/zcode",
+            "/usr/bin/zcode"
+        )
+        foreach ($path in $commonPaths) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                return (Resolve-Path -LiteralPath $path).Path
+            }
+        }
+    }
+    else {
+        $commonDirs = @(
+            (Join-Path $env:LOCALAPPDATA "Programs\ZCode"),
+            (Join-Path $env:ProgramFiles "ZCode"),
+            (Join-Path "$env:ProgramFiles(x86)" "ZCode"),
+            (Join-Path $env:APPDATA "ZCode")
+        )
+        foreach ($dir in $commonDirs) {
+            $candidate = Join-Path $dir "ZCode.exe"
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                return $candidate
+            }
+        }
+    }
+
+    return $null
 }
 
 function Start-ZCodeWithDebugging {
@@ -894,8 +966,18 @@ function Resolve-MediaForCurrentRun {
 # ============================================================
 $mediaServer = $null
 try {
-    if (-not (Test-Path -LiteralPath $ZCodePath -PathType Leaf)) {
-        throw "ZCode 主程序不存在：$ZCodePath"
+    # ZCode 路径：未指定或所给路径不存在时，自动探测本机安装位置。
+    if ([string]::IsNullOrWhiteSpace($ZCodePath) -or -not (Test-Path -LiteralPath $ZCodePath -PathType Leaf)) {
+        if (-not [string]::IsNullOrWhiteSpace($ZCodePath)) {
+            Write-Warning "指定的 ZCode 路径不存在：$ZCodePath，尝试自动探测。"
+        }
+        $detected = Find-ZCodeExecutable
+        if ($detected) {
+            $ZCodePath = $detected
+            Write-Host "已自动探测到 ZCode：$ZCodePath"
+        } else {
+            throw "未找到 ZCode 安装路径。请用 -ZCodePath 参数手动指定 ZCode 主程序路径。"
+        }
     }
     $resolvedZCodePath = (Resolve-Path -LiteralPath $ZCodePath).Path
 

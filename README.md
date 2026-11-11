@@ -1,6 +1,6 @@
 # ZCode 背景注入工具
 
-> 🪟 仅支持 **Windows 10 1607+ / Win11** | 需要 PowerShell 7 + ZCode
+> 🖥️ 支持 **Windows 10 1607+ / Win11** 与 **Ubuntu 26.04（Linux）** | 需要 PowerShell 7 + ZCode
 
 给 [ZCode](https://z.ai) 编辑器注入自定义背景：支持图片/视频、目录随机、图片视频 1:1 混合轮换、运行时定时换背景、图片/视频分别设透明度。
 
@@ -23,6 +23,26 @@ pwsh -ExecutionPolicy Bypass -File .\install-zcode-background-shortcut.ps1
 > 💡 自动探测失败（极少数情况）时手动指定：`-ZCodePath "C:\...\ZCode.exe"`
 
 > ⚠️ 工具会**先关闭再重启 ZCode**（需带调试端口启动）。运行前请保存工作。
+
+---
+
+## 🐧 Linux（Ubuntu 26.04）快速开始
+
+```bash
+# 1. 下载仓库到固定位置
+git clone https://github.com/Ghostknight0/zcode-background.git && cd zcode-background
+
+# 2. 运行 Linux 安装脚本（自动探测 ZCode；缺 pwsh 时自动下载到 ~/.local，无需 root）
+pwsh -File ./install-zcode-background-linux.ps1
+```
+
+装完在应用菜单里点「ZCode Background」启动即可。与 Windows 版的差别：
+
+- **无 C# 启动器**：`.desktop` 直接拉起 `pwsh`（路径写死在 Exec 里，全部参数已解析为绝对路径）。
+- **pwsh 自动安装**：找不到 `pwsh` 时自动从 PowerShell 官方 GitHub 下载 linux-x64 包到 `~/.local/share/powershell` 并链接 `~/.local/bin/pwsh`；不想自动装可加 `-SkipPwshInstall`，或用 snap 预装：`sudo snap install powershell --classic`。
+- **ZCode 探测顺序**：运行中进程 → PATH `/usr/bin/zcode` → `/opt/ZCode/zcode` 等常见路径（deb 安装直接识别）。
+- **超级模式行为一致**：`random` / `image` / `video`、双透明度、`-RotateInterval` 定时轮换、端口 9230/9231 全平台一致。
+- 卸载：`rm ~/.local/share/applications/zcode-background.desktop`，ZCode 不受影响。
 
 ---
 
@@ -72,11 +92,11 @@ pwsh -ExecutionPolicy Bypass -File .\install-zcode-background-shortcut.ps1 `
 | 问题 | 解决 |
 |---|---|
 | ZCode 没出现/闪退 | `pwsh -File .\zcode-background.ps1 -ValidateOnly` 验证参数（不会关 ZCode） |
-| 报「PowerShell 不存在」 | 装 PowerShell 7（不要用 5.1，会乱码） |
+| 报「PowerShell 不存在」 | 装 PowerShell 7（Windows 用官方安装包；Linux 用安装脚本自动下载，不要用 5.1，会乱码） |
 | 报「媒体目录无文件」 | 检查目录格式/文件是否仅在线（OneDrive 占位） |
 | 视频空白不播放 | 多半格式问题（mkv/avi），转成 mp4；`Ctrl+Shift+I` 看 Console |
 | 端口 9231 被占 | 自动往后找，无需处理 |
-| HTTP 进程残留 | 任务管理器结束 `pwsh.exe` |
+| HTTP 进程残留 | Windows：任务管理器结束 `pwsh.exe`；Linux：`pkill -f zcode-background.ps1` |
 | 卸载 | 删快捷方式 + 删仓库目录，ZCode 不受影响 |
 
 ---
